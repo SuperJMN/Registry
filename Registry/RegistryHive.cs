@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using NFluent;
 using Registry.Abstractions;
 using Registry.Cells;
 using Registry.Lists;
@@ -16,6 +15,8 @@ namespace Registry
     // public classes...
     public class RegistryHive : RegistryBase
     {
+        //   private const string wildCardChar = "¿";
+        private const string wildCardChar = "*";
         internal static int HardParsingErrorsInternal;
         internal static int SoftParsingErrorsInternal;
         private readonly Dictionary<string, RegistryKey> _keyPathKeyMap = new Dictionary<string, RegistryKey>();
@@ -41,7 +42,7 @@ namespace Registry
             UnassociatedRegistryValues = new List<KeyValue>();
         }
 
-        public RegistryHive(byte[] rawBytes) : base(rawBytes)
+        public RegistryHive(byte[] rawBytes, string filePath) : base(rawBytes, filePath)
         {
             CellRecords = new Dictionary<long, ICellTemplate>();
             ListRecords = new Dictionary<long, IListTemplate>();
@@ -133,16 +134,9 @@ namespace Registry
             return dn;
         }
 
-        /// <summary>
-        ///     Given a set of Registry transaction logs, apply them in order to an existing hive's data
-        /// </summary>
-        /// <param name="logFiles"></param>
-        /// <param name="updateExistingData"></param>
-        /// <remarks>Hat tip: https://github.com/msuhanov</remarks>
-        /// <returns>Byte array containing the updated bytes</returns>
-        public byte[] ProcessTransactionLogs(List<string> logFiles,bool updateExistingData = false)
+        public byte[] ProcessTransactionLogs(List<TransactionLogFileInfo> logFileInfos, bool updateExistingData = false)
         {
-            if (logFiles.Count == 0)
+            if (logFileInfos.Count == 0)
             {
                 throw new Exception("No logs were supplied");
             }
@@ -156,15 +150,14 @@ namespace Registry
 
             var logs = new List<TransactionLog>();
 
-            foreach (var ofFileName in logFiles)
+            foreach (var logFile in logFileInfos)
             {
-                var fi = new FileInfo(ofFileName);
-                if (fi.Length == 0)
+                if (logFile.FileBytes.Length == 0)
                 {
                     continue;
                 }
 
-                var transLog = new TransactionLog(ofFileName);
+                var transLog = new TransactionLog(logFile.FileBytes, logFile.FileName);
 
                 if (HiveType != transLog.HiveType)
                 {
@@ -176,7 +169,7 @@ namespace Registry
                 {
                     //log predates the last confirmed update, so skip  
                     Logger.Warn(
-                        $"Dropping {ofFileName} because the log's header.PrimarySequenceNumber is less than the hive's header.SecondarySequenceNumber");
+                        $"Dropping {logFile.FileBytes} because the log's header.PrimarySequenceNumber is less than the hive's header.SecondarySequenceNumber");
                     continue;
                 }
 
@@ -190,8 +183,8 @@ namespace Registry
 
             //get first and second, do the compares
 
-            var logOne = logs.SingleOrDefault(t => t.LogPath.ToLowerInvariant().EndsWith("log1"));
-            var logTwo = logs.SingleOrDefault(t => t.LogPath.ToLowerInvariant().EndsWith("log2"));
+            var logOne = logs.SingleOrDefault(t => t.LogPath.EndsWith("log1", StringComparison.OrdinalIgnoreCase));
+            var logTwo = logs.SingleOrDefault(t => t.LogPath.EndsWith("log2", StringComparison.OrdinalIgnoreCase));
             TransactionLog soloLog = null;
 
             if (logOne != null && logTwo != null)
@@ -233,14 +226,15 @@ namespace Registry
                     wasUpdated = true;
                 }
 
-                maximumSequenceNumber = firstLog.TransactionLogEntries.Max(t => t.SequenceNumber);
+                maximumSequenceNumber = firstLog.NewSequenceNumber;
 
                 if (secondLog.Header.PrimarySequenceNumber == maximumSequenceNumber + 1 &&
                     secondLog.Header.PrimarySequenceNumber > Header.SecondarySequenceNumber)
                 {
                     Logger.Info($"Replaying log file: {secondLog.LogPath}");
                     bytes = secondLog.UpdateHiveBytes(bytes);
-                    maximumSequenceNumber = secondLog.TransactionLogEntries.Max(t => t.SequenceNumber);
+                    maximumSequenceNumber =
+                        secondLog.NewSequenceNumber; //TransactionLogEntries.Max(t => t.SequenceNumber);
                 }
             }
             else if (logOne != null)
@@ -261,7 +255,8 @@ namespace Registry
                     Logger.Info($"Replaying log file: {soloLog.LogPath}");
                     //we can replay the log
                     bytes = soloLog.UpdateHiveBytes(bytes);
-                    maximumSequenceNumber = soloLog.TransactionLogEntries.Max(t => t.SequenceNumber);
+                    maximumSequenceNumber =
+                        soloLog.NewSequenceNumber; //TransactionLogEntries.Max(t => t.SequenceNumber);
                     wasUpdated = true;
                 }
             }
@@ -274,8 +269,12 @@ namespace Registry
                 Buffer.BlockCopy(seqBytes, 0, bytes, 0x4, 0x4); //Primary #
                 Buffer.BlockCopy(seqBytes, 0, bytes, 0x8, 0x4); //Secondary #
 
+                var newchecksum = CalculateCheckSum(bytes);
+                var newcheckBytes = BitConverter.GetBytes(newchecksum);
+                Buffer.BlockCopy(newcheckBytes,0,bytes,0x1fc,4);
+
                 Logger.Info(
-                    $"At least one transaction log was applied. Sequence numbers have been updated to 0x{maximumSequenceNumber:X4}");
+                    $"At least one transaction log was applied. Sequence numbers have been updated to 0x{maximumSequenceNumber:X4}. New ChecksumL 0x{newchecksum:X}");
             }
 
             if (updateExistingData)
@@ -287,6 +286,62 @@ namespace Registry
             return bytes;
         }
 
+
+      private int CalculateCheckSum(byte[] bytes)
+      {
+
+          var index = 0;
+          var xsum = 0;
+          while (index <= 0x1fb)
+          {
+              xsum ^= BitConverter.ToInt32(bytes, index);
+              index += 0x04;
+          }
+
+          return xsum;
+      }
+
+
+        /// <summary>
+        ///     Given a set of Registry transaction logs, apply them in order to an existing hive's data
+        /// </summary>
+        /// <param name="logFiles"></param>
+        /// <param name="updateExistingData"></param>
+        /// <remarks>Hat tip: https://github.com/msuhanov</remarks>
+        /// <returns>Byte array containing the updated bytes</returns>
+        public byte[] ProcessTransactionLogs(List<string> logFiles, bool updateExistingData = false)
+        {
+            if (logFiles.Count == 0)
+            {
+                throw new Exception("No logs were supplied");
+            }
+
+            if (Header.PrimarySequenceNumber == Header.SecondarySequenceNumber)
+            {
+                throw new Exception("Sequence numbers match! Hive is not dirty");
+            }
+
+            var logfileInfos = new List<TransactionLogFileInfo>();
+
+            foreach (var ofFileName in logFiles)
+            {
+                //get bytes for file
+                var b = File.ReadAllBytes(ofFileName);
+
+
+                if (b.Length == 0)
+                {
+                    continue;
+                }
+
+                var lfi = new TransactionLogFileInfo(ofFileName, b);
+
+                logfileInfos.Add(lfi);
+            }
+
+            return ProcessTransactionLogs(logfileInfos, updateExistingData);
+        }
+
         //TODO this needs refactored to remove duplicated code
         private List<RegistryKey> GetSubKeysAndValues(RegistryKey key)
         {
@@ -294,7 +349,7 @@ namespace Registry
 
             _keyPathKeyMap.Add(key.KeyPath.ToLowerInvariant(), key);
 
-            Logger.Trace("Getting subkeys for {0}", key.KeyPath);
+            //    Logger.Trace("Getting subkeys for {0}", key.KeyPath);
 
             key.KeyFlags = RegistryKey.KeyFlagsEnum.HasActiveParent;
 
@@ -302,12 +357,12 @@ namespace Registry
 
             if (key.NkRecord.ClassCellIndex > 0)
             {
-                Logger.Trace("Getting Class cell information at relative offset 0x{0:X}", key.NkRecord.ClassCellIndex);
+                //         Logger.Trace("Getting Class cell information at relative offset 0x{0:X}", key.NkRecord.ClassCellIndex);
                 var d = GetDataNodeFromOffset(key.NkRecord.ClassCellIndex);
                 d.IsReferenced = true;
                 var clsName = Encoding.Unicode.GetString(d.Data, 0, key.NkRecord.ClassLength);
                 key.ClassName = clsName;
-                Logger.Debug("Class name found {0}", clsName);
+                //         Logger.Trace("Class name found {0}", clsName);
             }
 
             //Build ValueOffsets for this NKRecord
@@ -315,52 +370,105 @@ namespace Registry
             {
                 //there are values for this key, so get the offsets so we can pull them next
 
-                Logger.Debug("Getting value list offset at relative offset 0x{0:X}. Value count is {1:N0}",
-                    key.NkRecord.ValueListCellIndex, key.NkRecord.ValueListCount);
+                //         Logger.Trace("Getting value list offset at relative offset 0x{0:X}. Value count is {1:N0}",
+                //     key.NkRecord.ValueListCellIndex, key.NkRecord.ValueListCount);
 
 
                 var offsetList = GetDataNodeFromOffset(key.NkRecord.ValueListCellIndex);
 
                 offsetList.IsReferenced = true;
 
+                var lastI = 0;
                 for (var i = 0; i < key.NkRecord.ValueListCount; i++)
                 {
                     //use i * 4 so we get 4, 8, 12, 16, etc
                     var os = BitConverter.ToUInt32(offsetList.Data, i * 4);
-                    Logger.Trace("Got value offset 0x{0:X}", os);
+                    //             Logger.Trace("Got value offset 0x{0:X}", os);
                     key.NkRecord.ValueOffsets.Add(os);
+                    lastI = i;
+                }
+
+                if (RecoverDeleted)
+                {
+                    //check to see if there are any other values hanging out in this list beyond what is expected
+                    lastI += 1; //lastI initially points to where we left off, so add 1
+                    var offsetIndex = lastI * 4; //our starting point
+                    while (offsetIndex < offsetList.Data.Length)
+                    {
+                        var os = BitConverter.ToUInt32(offsetList.Data, offsetIndex);
+
+                        if (os < 8 || os % 8 != 0)
+                        {
+                            break;
+                        }
+
+                        //        Logger.Trace("Got value offset 0x{0:X}", os);
+
+                        if (key.NkRecord.ValueOffsets.Contains(os) == false)
+                        {
+                            key.NkRecord.ValueOffsets.Add(os);
+                        }
+
+                        offsetIndex += 4;
+                    }
                 }
             }
 
-            if (key.NkRecord.ValueOffsets.Count != key.NkRecord.ValueListCount)
-            {
-//ncrunch: no coverage
-                Logger.Warn(
-                    "Value count mismatch! ValueListCount is {0:N0} but NKRecord.ValueOffsets.Count is {1:N0}",
-                    //ncrunch: no coverage
-                    key.NkRecord.ValueListCount, key.NkRecord.ValueOffsets.Count);
-            } //ncrunch: no coverage
-
+            var valOffsetIndex = 0;
             // look for values in this key 
             foreach (var valueOffset in key.NkRecord.ValueOffsets)
             {
-                Logger.Trace("Looking for vk record at relative offset 0x{0:X}", valueOffset);
+                //        Logger.Trace("Looking for vk record at relative offset 0x{0:X}", valueOffset);
 
+                if (CellRecords.ContainsKey((long) valueOffset))
+                {
+                    var vc = CellRecords[(long) valueOffset];
 
-                var vc = CellRecords[(long) valueOffset];
+                    var vk = vc as VkCellRecord;
 
-                var vk = vc as VkCellRecord;
+                    if (vk is null)
+                    {
+                        continue;
+                    }
 
-                Logger.Trace("Found vk record at relative offset 0x{0:X}. Value name: {1}", valueOffset, vk.ValueName);
+                    //           Logger.Trace("Found vk record at relative offset 0x{0:X}. Value name: {1}", valueOffset,
+                    //  vk.ValueName);
 
-                vk.IsReferenced = true;
+                    if (valOffsetIndex >= key.NkRecord.ValueListCount)
+                    {
+                        if (vk.IsFree == false)
+                        {
+                            //not a free record, so cant add it
+                            continue;
+                        }
+                    }
 
-                var value = new KeyValue(vk);
+                    vk.IsReferenced = true;
 
-                key.Values.Add(value);
+                    var value = new KeyValue(vk);
+
+                    key.Values.Add(value);
+                }
+                else
+                {
+                    if (valOffsetIndex < key.NkRecord.ValueListCount)
+                    {
+                        Logger.Warn($"An expected value was not found at offset 0x{valueOffset:X}. Key: {key.KeyPath}");
+                    }
+                }
+
+                valOffsetIndex += 1;
             }
 
-            Logger.Trace("Looking for sk record at relative offset 0x{0:X}", key.NkRecord.SecurityCellIndex);
+            if (key.Values.Count != key.NkRecord.ValueListCount)
+            {
+                Logger.Debug(
+                    "{2}: Value count mismatch! ValueListCount is {0:N0} but NKRecord.ValueOffsets.Count is {1:N0}",
+                    //ncrunch: no coverage
+                    key.NkRecord.ValueListCount, key.NkRecord.ValueOffsets.Count, key.KeyPath);
+            }
+
+            //      Logger.Trace("Looking for sk record at relative offset 0x{0:X}", key.NkRecord.SecurityCellIndex);
 
 //            var sk = CellRecords[key.NKRecord.SecurityCellIndex] as SKCellRecord;
 //            sk.IsReferenced = true;
@@ -381,8 +489,8 @@ namespace Registry
                 return keys;
             }
 
-            Logger.Trace("Looking for list record at relative offset 0x{0:X}",
-                key.NkRecord.SubkeyListsStableCellIndex);
+            //    Logger.Trace("Looking for list record at relative offset 0x{0:X}",
+            //         key.NkRecord.SubkeyListsStableCellIndex);
             var l = ListRecords[key.NkRecord.SubkeyListsStableCellIndex];
 
             var sig = BitConverter.ToInt16(l.RawBytes, 4);
@@ -395,7 +503,7 @@ namespace Registry
                     lxRecord.IsReferenced = true;
                     foreach (var offset in lxRecord.Offsets)
                     {
-                        Logger.Trace("In lf or lh, looking for nk record at relative offset 0x{0:X}", offset.Key);
+                        //            Logger.Trace("In lf or lh, looking for nk record at relative offset 0x{0:X}", offset.Key);
 
                         if (CellRecords.ContainsKey(offset.Key) == false)
                         {
@@ -408,8 +516,8 @@ namespace Registry
                         var nk = cell as NkCellRecord;
                         nk.IsReferenced = true;
 
-                        Logger.Trace("In lf or lh, found nk record at relative offset 0x{0:X}. Name: {1}", offset.Key,
-                            nk.Name);
+                        //          Logger.Trace("In lf or lh, found nk record at relative offset 0x{0:X}. Name: {1}", offset.Key,
+                        //     nk.Name);
 
                         var tempKey = new RegistryKey(nk, key);
 
@@ -426,7 +534,7 @@ namespace Registry
                     riRecord.IsReferenced = true;
                     foreach (var offset in riRecord.Offsets)
                     {
-                        Logger.Trace("In ri, looking for list record at relative offset 0x{0:X}", offset);
+                        //           Logger.Trace("In ri, looking for list record at relative offset 0x{0:X}", offset);
                         var tempList = ListRecords[offset];
 
                         //templist is now an li or lh list 
@@ -437,7 +545,7 @@ namespace Registry
 
                             foreach (var offset1 in sk3.Offsets)
                             {
-                                Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}", offset1);
+                                //                    Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}", offset1);
                                 var cell = CellRecords[offset1];
 
                                 var nk = cell as NkCellRecord;
@@ -458,8 +566,8 @@ namespace Registry
 
                             foreach (var offset3 in lxRecord2.Offsets)
                             {
-                                Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}",
-                                    offset3.Key);
+                                //                  Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}",
+                                //            offset3.Key);
                                 var cell = CellRecords[offset3.Key];
 
                                 var nk = cell as NkCellRecord;
@@ -482,7 +590,7 @@ namespace Registry
                     liRecord.IsReferenced = true;
                     foreach (var offset in liRecord.Offsets)
                     {
-                        Logger.Trace("In li, looking for nk record at relative offset 0x{0:X}", offset);
+                        //           Logger.Trace("In li, looking for nk record at relative offset 0x{0:X}", offset);
                         var cell = CellRecords[offset];
 
                         var nk = cell as NkCellRecord;
@@ -693,6 +801,9 @@ namespace Registry
         {
             keyPath = keyPath.ToLowerInvariant();
 
+            //trim slashes to match the value in keyPathKeyMap
+            keyPath = keyPath.Trim('\\', '/');
+
             if (_keyPathKeyMap.ContainsKey(keyPath))
             {
                 return _keyPathKeyMap[keyPath];
@@ -739,14 +850,14 @@ namespace Registry
             var hiveLength = Header.Length + 0x1000;
             if (hiveLength < FileBytes.Length)
             {
-                Logger.Warn($"Header length is smaller than the size of the file.");
+                Logger.Debug("Header length is smaller than the size of the file.");
                 hiveLength = (uint) FileBytes.Length;
             }
 
             if (Header.PrimarySequenceNumber != Header.SecondarySequenceNumber)
             {
                 Logger.Warn(
-                    $"Sequence numbers do not match! Hive is dirty and the transaction logs should be reviewed for relevant data!");
+                    "Sequence numbers do not match! Hive is dirty and the transaction logs should be reviewed for relevant data!");
             }
 
             //keep reading the file until we reach the end
@@ -756,7 +867,7 @@ namespace Registry
 
                 if (hbinSize == 0)
                 {
-                    Logger.Info("Found hbin with size 0 at absolute offset 0x{0:X}", offsetInHive);
+                    Logger.Debug("Found hbin with size 0 at absolute offset 0x{0:X}", offsetInHive);
                     // Go to end if we find a 0 size block (padding?)
                     offsetInHive = HiveLength();
                     continue;
@@ -777,10 +888,9 @@ namespace Registry
                     break;
                 }
 
-                Check.That(hbinSig).IsEqualTo(HbinSignature);
 
-                Logger.Debug(
-                    $"Processing hbin at absolute offset 0x{offsetInHive:X} with size 0x{hbinSize:X} Percent done: {(double) offsetInHive / hiveLength:P}");
+                //        Logger.Trace(
+                //              $"Processing hbin at absolute offset 0x{offsetInHive:X} with size 0x{hbinSize:X} Percent done: {(double) offsetInHive / hiveLength:P}");
 
                 var rawhbin = ReadBytesFromHive(offsetInHive, (int) hbinSize);
 
@@ -788,26 +898,26 @@ namespace Registry
                 {
                     var h = new HBinRecord(rawhbin, offsetInHive - 0x1000, Header.MinorVersion, RecoverDeleted, this);
 
-                    Logger.Trace("hbin info: {0}", h);
+                    //            Logger.Trace("hbin info: {0}", h);
 
-                    Logger.Trace("Getting records from hbin at absolute offset 0x{0:X}", offsetInHive);
+                    //            Logger.Trace("Getting records from hbin at absolute offset 0x{0:X}", offsetInHive);
 
                     var records = h.Process();
 
-                    Logger.Trace("Found {0:N0} records from hbin at absolute offset 0x{1:X}", records.Count,
-                        offsetInHive);
+                    //             Logger.Trace("Found {0:N0} records from hbin at absolute offset 0x{1:X}", records.Count,
+                    //                 offsetInHive);
 
                     foreach (var record in records)
-                    {
                         //TODO change this to compare against constants?
+                    {
                         switch (record.Signature)
                         {
                             case "nk":
                             case "sk":
                             case "lk":
                             case "vk":
-                                Logger.Trace("Adding cell record with signature {0} at absolute offset 0x{1:X}",
-                                    record.Signature, record.AbsoluteOffset);
+                                //                      Logger.Trace("Adding cell record with signature {0} at absolute offset 0x{1:X}",
+                                //                           record.Signature, record.AbsoluteOffset);
                                 CellRecords.Add(record.AbsoluteOffset - 4096, (ICellTemplate) record);
                                 break;
 
@@ -816,8 +926,8 @@ namespace Registry
                             case "ri":
                             case "lh":
                             case "lf":
-                                Logger.Trace("Adding list record with signature {0} at absolute offset 0x{1:X}",
-                                    record.Signature, record.AbsoluteOffset);
+                                //                  Logger.Trace("Adding list record with signature {0} at absolute offset 0x{1:X}",
+                                //                        record.Signature, record.AbsoluteOffset);
                                 ListRecords.Add(record.AbsoluteOffset - 4096, (IListTemplate) record);
                                 break;
                         }
@@ -834,7 +944,7 @@ namespace Registry
                 offsetInHive += hbinSize;
             }
 
-            Logger.Info("Initial processing complete. Building tree...");
+            Logger.Debug("Initial processing complete. Building tree...");
 
             //The root node can be found by either looking at Header.RootCellOffset or looking for an nk record with HiveEntryRootKey flag set.
             //here we are looking for the flag
@@ -861,21 +971,19 @@ namespace Registry
             }
 
             //validate what we found above via the flag method
-            Check.That((long) Header.RootCellOffset).IsEqualTo(rootNode.RelativeOffset);
 
             rootNode.IsReferenced = true;
 
-            Logger.Info("Found root node! Getting subkeys...");
+            Logger.Debug("Found root node! Getting subkeys...");
 
             Root = new RegistryKey(rootNode, null);
             Logger.Debug("Created root node object. Getting subkeys.");
-
 
             var keys = GetSubKeysAndValues(Root);
 
             Root.SubKeys.AddRange(keys);
 
-            Logger.Info("Hive processing complete!");
+            Logger.Debug("Hive processing complete!");
 
             //All processing is complete, so we do some tests to see if we really saw everything
             if (RecoverDeleted && HiveLength() != TotalBytesRead)
@@ -894,11 +1002,10 @@ namespace Registry
 
                 if (Header.Length != TotalBytesRead - 0x1000)
                 {
-//ncrunch: no coverage
                     Logger.Warn( //ncrunch: no coverage
                         "Hive length (0x{0:x}) does not equal bytes read (0x{1:x})!! Check the end of the hive for erroneous data",
                         HiveLength(), TotalBytesRead);
-                } //ncrunch: no coverage
+                }
             }
 
             if (RecoverDeleted)
@@ -908,7 +1015,7 @@ namespace Registry
 
             if (FlushRecordListsAfterParse)
             {
-                Logger.Info("Flushing record lists...");
+                Logger.Debug("Flushing record lists...");
                 ListRecords.Clear();
 
                 var toRemove = CellRecords.Where(pair => pair.Value is NkCellRecord || pair.Value is VkCellRecord)
@@ -925,13 +1032,58 @@ namespace Registry
             return true;
         }
 
+        public HashSet<string> ExpandKeyPath(string wildCardPath)
+        {
+            wildCardPath = wildCardPath.Trim('\\', '/');
+
+            var keyPaths = new HashSet<string>();
+
+            wildCardPath = wildCardPath.ToLowerInvariant();
+
+            if (wildCardPath.Contains(wildCardChar) == false)
+            {
+                keyPaths.Add(wildCardPath);
+                return keyPaths;
+            }
+
+            if (wildCardPath.ToUpperInvariant().StartsWith(Root.KeyName.ToUpperInvariant()) == false)
+            {
+                //ensure things look proper for our matching later
+                wildCardPath = $"{Root.KeyName}\\{wildCardPath}";
+            }
+
+            wildCardPath = wildCardPath.ToLowerInvariant();
+
+            if (_keyPathKeyMap.ContainsKey(wildCardPath))
+            {
+                keyPaths.Add(wildCardPath);
+            }
+
+            wildCardPath = Regex.Escape(wildCardPath);
+
+            var pattern = $"^{wildCardPath.Replace("\\*", "[^\\\\]*?")}$";
+
+            var regexPattern = new Regex(pattern,
+                RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
+
+            foreach (var key in _keyPathKeyMap.Keys)
+            {
+                if (regexPattern.IsMatch(key))
+                {
+                    keyPaths.Add(key);
+                }
+            }
+
+            return keyPaths;
+        }
+
         /// <summary>
         ///     Associates vk records with NK records and builds a hierarchy of nk records
         ///     <remarks>Results of this method will be available in DeletedRegistryKeys</remarks>
         /// </summary>
         private void BuildDeletedRegistryKeys()
         {
-            Logger.Info("Associating deleted keys and values...");
+            Logger.Debug("Associating deleted keys and values...");
 
             var unreferencedNkCells = CellRecords.Where(t => t.Value.IsReferenced == false && t.Value is NkCellRecord);
 
@@ -946,13 +1098,13 @@ namespace Registry
                 {
                     var nk = unreferencedNkCell.Value as NkCellRecord;
 
-                    Logger.Debug("Processing deleted nk record at absolute offset 0x{0:X}", nk.AbsoluteOffset);
+                    //       Logger.Trace("Processing deleted nk record at absolute offset 0x{0:X}", nk.AbsoluteOffset);
 
 
                     if (nk.ValueListCount > 10000)
                     {
-                        Logger.Warn(
-                            $"When getting values for nk record at absolute offset 0x{nk.AbsoluteOffset:X}, implausable value count ({nk.ValueListCount:N0}). Skipping");
+                        //             Logger.Trace(
+                        //                  $"When getting values for nk record at absolute offset 0x{nk.AbsoluteOffset:X}, implausable value count ({nk.ValueListCount:N0}). Skipping");
                         continue;
                     }
 
@@ -974,8 +1126,8 @@ namespace Registry
                     {
                         //there are values for this key, so get the offsets so we can pull them next
 
-                        Logger.Trace("Processing deleted nk record values for nk at absolute offset 0x{0:X}",
-                            nk.AbsoluteOffset);
+                        //              Logger.Trace("Processing deleted nk record values for nk at absolute offset 0x{0:X}",
+                        //                  nk.AbsoluteOffset);
 
                         DataNode offsetList = null;
 
@@ -985,8 +1137,6 @@ namespace Registry
 
                         if (sizeNum > regKey.NkRecord.ValueListCount * 4 + 4)
                         {
-                            //ValueListCount is the number of offsets we should be looking for. they are 4 bytes long
-                            //If the size of the data record at regKey.NKRecord.ValueListCellIndex exceeds the total number of bytes plus the size (another 4 bytes), reset it to a more sane value to avoid crazy long reads
                             sizeNum = regKey.NkRecord.ValueListCount * 4 + 4;
                         }
 
@@ -1003,15 +1153,16 @@ namespace Registry
                         {
 //ncrunch: no coverage
                             //sometimes the data node doesn't have enough data to even do this, or its wrong data
-                            Logger.Warn( //ncrunch: no coverage
-                                "When getting values for nk record at absolute offset 0x{0:X}, not enough/invalid data was found at offset 0x{1:X}to look for value offsets. Value recovery is not possible",
-                                nk.AbsoluteOffset, regKey.NkRecord.ValueListCellIndex);
+                            //                 Logger.Trace( //ncrunch: no coverage
+                            //                         "When getting values for nk record at absolute offset 0x{0:X}, not enough/invalid data was found at offset 0x{1:X}to look for value offsets. Value recovery is not possible",
+                            //         nk.AbsoluteOffset, regKey.NkRecord.ValueListCellIndex);
                         } //ncrunch: no coverage
 
+                        var lastI = 0;
                         if (offsetList != null)
                         {
-                            Logger.Trace("Found offset list for nk at absolute offset 0x{0:X}. Processing.",
-                                nk.AbsoluteOffset);
+                            //                Logger.Trace("Found offset list for nk at absolute offset 0x{0:X}. Processing.",
+                            //                     nk.AbsoluteOffset);
                             try
                             {
                                 for (var i = 0; i < regKey.NkRecord.ValueListCount; i++)
@@ -1020,28 +1171,53 @@ namespace Registry
                                     var os = BitConverter.ToUInt32(offsetList.Data, i * 4);
 
                                     regKey.NkRecord.ValueOffsets.Add(os);
+                                    lastI = i;
                                 }
                             }
                             catch (Exception) //ncrunch: no coverage
                             {
 //ncrunch: no coverage
-                                Logger.Warn( //ncrunch: no coverage
-                                    "When getting value offsets for nk record at absolute offset 0x{0:X}, not enough data was found at offset 0x{1:X} to look for all value offsets. Only partial value recovery possible",
-                                    nk.AbsoluteOffset, regKey.NkRecord.ValueListCellIndex);
+                                //                     Logger.Trace( //ncrunch: no coverage
+                                //                          "When getting value offsets for nk record at absolute offset 0x{0:X}, not enough data was found at offset 0x{1:X} to look for all value offsets. Only partial value recovery possible",
+                                //                          nk.AbsoluteOffset, regKey.NkRecord.ValueListCellIndex);
                             } //ncrunch: no coverage
+
+                            //check to see if there are any other values hanging out in this list beyond what is expected
+                            lastI += 1; //lastI initially points to where we left off, so add 1
+                            var offsetIndex = lastI * 4; //our starting point
+                            while (offsetIndex < offsetList.Data.Length)
+                            {
+                                var os = BitConverter.ToUInt32(offsetList.Data, offsetIndex);
+
+                                if (os < 8 || os % 8 != 0)
+                                {
+                                    break;
+                                }
+
+                                Logger.Trace("Got value offset 0x{0:X}", os);
+
+                                if (regKey.NkRecord.ValueOffsets.Contains(os) == false)
+                                {
+                                    regKey.NkRecord.ValueOffsets.Add(os);
+                                }
+
+                                offsetIndex += 4;
+                            }
                         }
                     }
 
-                    Logger.Trace("Looking for vk records for nk record at absolute offset 0x{0:X}", nk.AbsoluteOffset);
+                    //         Logger.Trace("Looking for vk records for nk record at absolute offset 0x{0:X}", nk.AbsoluteOffset);
 
+
+                  //  var valOffsetIndex = 0;
                     //For each value offset, get the vk record if it exists, create a KeyValue, and assign it to the current RegistryKey
                     foreach (var valueOffset in nk.ValueOffsets)
                     {
                         if (CellRecords.ContainsKey((long) valueOffset))
                         {
-                            Logger.Trace(
-                                "Found vk record at relative offset 0x{0:X} for nk record at absolute offset 0x{1:X}",
-                                valueOffset, nk.AbsoluteOffset);
+                            //                 Logger.Trace(
+                            //                      "Found vk record at relative offset 0x{0:X} for nk record at absolute offset 0x{1:X}",
+                            //     valueOffset, nk.AbsoluteOffset);
 
                             var val = CellRecords[(long) valueOffset] as VkCellRecord;
                             //we have a value for this key
@@ -1051,41 +1227,37 @@ namespace Registry
                                 //if its an in use record AND referenced, warn
                                 if (val.IsFree == false && val.IsReferenced)
                                 {
-                                    Logger.Warn(
-                                        "When getting values for nk record at absolute offset 0x{0:X}, VK record at relative offset 0x{1:X} isn't free and is referenced by another nk record. Skipping!",
-                                        nk.AbsoluteOffset, valueOffset);
+                                    //                        Logger.Trace(
+                                    //                              "When getting values for nk record at absolute offset 0x{0:X}, VK record at relative offset 0x{1:X} isn't free and is referenced by another nk record. Skipping!",
+                                    //             nk.AbsoluteOffset, valueOffset);
                                 }
                                 else
                                 {
                                     associatedVkRecordOffsets.Add(val.RelativeOffset);
 
+
                                     var kv = new KeyValue(val);
 
                                     regKey.Values.Add(kv);
-                                    Logger.Trace(
-                                        $"Added vk record at relative offset 0x{valueOffset:X} for nk record at absolute offset 0x{nk.AbsoluteOffset:X}");
+                                    //                         Logger.Trace(
+                                    //                             $"Added vk record at relative offset 0x{valueOffset:X} for nk record at absolute offset 0x{nk.AbsoluteOffset:X}");
                                 }
                             }
                         }
-                        else
-                        {
-                            Logger.Trace(
-                                $"vk record at relative offset 0x{valueOffset:X} not found for nk record at absolute offset 0x{nk.AbsoluteOffset:X}");
-                        }
                     }
 
-                    Logger.Trace(
-                        $"Associated {regKey.Values.Count:N0} value(s) out of {nk.ValueListCount:N0} possible values for nk record at absolute offset 0x{nk.AbsoluteOffset:X}");
+                    //          Logger.Trace(
+                    //              $"Associated {regKey.Values.Count:N0} value(s) out of {nk.ValueOffsets.Count:N0} possible values for nk record at absolute offset 0x{nk.AbsoluteOffset:X}");
 
 
                     deletedRegistryKeys.Add(nk.RelativeOffset, regKey);
                 }
-                catch (Exception ex) //ncrunch: no coverage
+                catch (Exception ) //ncrunch: no coverage
                 {
 //ncrunch: no coverage
-                    Logger.Error( //ncrunch: no coverage
-                        ex,
-                        $"Error while processing deleted nk record at absolute offset 0x{unreferencedNkCell.Value.AbsoluteOffset:X}");
+                    //             Logger.Trace( //ncrunch: no coverage
+                    //                 ex,
+                    //                 $"Error while processing deleted nk record at absolute offset 0x{unreferencedNkCell.Value.AbsoluteOffset:X}");
                 } //ncrunch: no coverage
             }
 
@@ -1108,9 +1280,9 @@ namespace Registry
                         //add the key as as subkey of its parent
                         var parent = deletedRegistryKeys[deletedRegistryKey.Value.NkRecord.ParentCellIndex];
 
-                        Logger.Debug(
-                            "Found subkey at absolute offset 0x{0:X} for parent key at absolute offset 0x{1:X}",
-                            deletedRegistryKey.Value.NkRecord.AbsoluteOffset, parent.NkRecord.AbsoluteOffset);
+                        //         Logger.Trace(
+                        //                 "Found subkey at absolute offset 0x{0:X} for parent key at absolute offset 0x{1:X}",
+                        //                     deletedRegistryKey.Value.NkRecord.AbsoluteOffset, parent.NkRecord.AbsoluteOffset);
 
                         deletedRegistryKey.Value.KeyPath = $@"{parent.KeyPath}\{deletedRegistryKey.Value.KeyName}";
 
@@ -1125,8 +1297,8 @@ namespace Registry
                 }
 
                 foreach (var l in keysToRemove)
-                {
                     //take out the key from main collection since we copied it above to its parent's subkey list
+                {
                     deletedRegistryKeys.Remove(l);
                 }
             }
@@ -1141,14 +1313,13 @@ namespace Registry
                     //an parent key has been located, so get it
                     var parentNk = CellRecords[deletedRegistryKey.Value.NkRecord.ParentCellIndex] as NkCellRecord;
 
-                    Logger.Debug(
-                        "Found possible parent key at absolute offset 0x{0:X} for deleted key at absolute offset 0x{1:X}",
-                        deletedRegistryKey.Value.NkRecord.ParentCellIndex + 0x1000,
-                        deletedRegistryKey.Value.NkRecord.AbsoluteOffset);
+                    //            Logger.Trace(
+                    //                 "Found possible parent key at absolute offset 0x{0:X} for deleted key at absolute offset 0x{1:X}",
+                    //                 deletedRegistryKey.Value.NkRecord.ParentCellIndex + 0x1000,
+                    //                 deletedRegistryKey.Value.NkRecord.AbsoluteOffset);
 
                     if (parentNk == null)
                     {
-                        //the data at that index is not an nkrecord
                         continue;
                     }
 
@@ -1157,9 +1328,9 @@ namespace Registry
                         //parent exists in our primary tree, so get that key
                         var pk = GetKey(deletedRegistryKey.Value.NkRecord.ParentCellIndex);
 
-                        Logger.Debug(
-                            "Copying subkey at absolute offset 0x{0:X} for parent key at absolute offset 0x{1:X}",
-                            deletedRegistryKey.Value.NkRecord.AbsoluteOffset, pk.NkRecord.AbsoluteOffset);
+                        //           Logger.Trace(
+                        //                "Copying subkey at absolute offset 0x{0:X} for parent key at absolute offset 0x{1:X}",
+                        //                deletedRegistryKey.Value.NkRecord.AbsoluteOffset, pk.NkRecord.AbsoluteOffset);
 
                         deletedRegistryKey.Value.KeyPath = $@"{pk.KeyPath}\{deletedRegistryKey.Value.KeyName}";
 
@@ -1179,9 +1350,9 @@ namespace Registry
                                 deletedRegistryKey.Value);
                         }
 
-                        Logger.Debug(
-                            "Associated deleted key at absolute offset 0x{0:X} to active parent key at absolute offset 0x{1:X}",
-                            deletedRegistryKey.Value.NkRecord.AbsoluteOffset, pk.NkRecord.AbsoluteOffset);
+                        //           Logger.Trace(
+                        //               "Associated deleted key at absolute offset 0x{0:X} to active parent key at absolute offset 0x{1:X}",
+                        //               deletedRegistryKey.Value.NkRecord.AbsoluteOffset, pk.NkRecord.AbsoluteOffset);
                     }
                 }
             }
@@ -1204,7 +1375,7 @@ namespace Registry
 
         private void UpdateChildPaths(RegistryKey key)
         {
-            Logger.Trace("Updating child paths or key {0}", key.KeyPath);
+            //     Logger.Trace("Updating child paths or key {0}", key.KeyPath);
             foreach (var sk in key.SubKeys)
             {
                 sk.KeyPath = $@"{key.KeyPath}\{sk.KeyName}";
@@ -1252,13 +1423,11 @@ namespace Registry
         public IEnumerable<ValueBySizeInfo> FindByValueSize(int minimumSizeInBytes)
         {
             foreach (var registryKey in _keyPathKeyMap)
+            foreach (var keyValue in registryKey.Value.Values)
             {
-                foreach (var keyValue in registryKey.Value.Values)
+                if (keyValue.ValueDataRaw.Length >= minimumSizeInBytes)
                 {
-                    if (keyValue.ValueDataRaw.Length >= minimumSizeInBytes)
-                    {
-                        yield return new ValueBySizeInfo(registryKey.Value, keyValue);
-                    }
+                    yield return new ValueBySizeInfo(registryKey.Value, keyValue);
                 }
             }
         }
@@ -1267,23 +1436,21 @@ namespace Registry
         public IEnumerable<SearchHit> FindBase64(int minLength)
         {
             foreach (var registryKey in _keyPathKeyMap)
+            foreach (var keyValue in registryKey.Value.Values)
             {
-                foreach (var keyValue in registryKey.Value.Values)
+                if (keyValue.ValueData.Trim().Length < minLength)
                 {
-                    if (keyValue.ValueData.Trim().Length < minLength)
-                    {
-                        continue;
-                    }
+                    continue;
+                }
 
-                    if (IsBase64String2(keyValue.ValueData))
-                    {
-                        yield return new SearchHit(registryKey.Value, keyValue, keyValue.ValueData);
-                    }
+                if (IsBase64String2(keyValue.ValueData))
+                {
+                    yield return new SearchHit(registryKey.Value, keyValue, keyValue.ValueData, keyValue.ValueData);
                 }
             }
         }
 
-        private bool IsBase64String2(string value)
+        private static bool IsBase64String2(string value)
         {
             if (string.IsNullOrEmpty(value) || value.Length % 4 != 0
                                             || value.Contains(' ') || value.Contains('\t') || value.Contains('\r') ||
@@ -1315,7 +1482,7 @@ namespace Registry
         }
 
         // Make it private as there is the name makes no sense for an outside caller
-        private bool IsInvalid(char value)
+        private static bool IsInvalid(char value)
         {
             var intValue = (int) value;
             if (intValue >= 48 && intValue <= 57)
@@ -1345,32 +1512,32 @@ namespace Registry
                 return false;
             }
 
-            return s.Length % 4 == 0 && Regex.IsMatch(s, @"^[a-zA-Z0-9\+/]*={0,3}$", RegexOptions.None);
+            return s.Length % 4 == 0 && Regex.IsMatch(s, @"^[a-zA-Z0-9\+/]*={0,3}$", RegexOptions.Compiled);
         }
 
 
         public IEnumerable<SearchHit> FindInKeyName(string searchTerm, bool useRegEx = false)
         {
             foreach (var registryKey in _keyPathKeyMap)
-            {
-//                if (registryKey.Value.KeyFlags.HasFlag(RegistryKey.KeyFlagsEnum.Deleted))
+                //                if (registryKey.Value.KeyFlags.HasFlag(RegistryKey.KeyFlagsEnum.Deleted))
 //                {
 //                    _logger.Warn("Deleted");
 //                }
 
 
+            {
                 if (useRegEx)
                 {
                     if (Regex.IsMatch(registryKey.Value.KeyName, searchTerm, RegexOptions.IgnoreCase))
                     {
-                        yield return new SearchHit(registryKey.Value, null, searchTerm);
+                        yield return new SearchHit(registryKey.Value, null, searchTerm, searchTerm);
                     }
                 }
                 else
                 {
                     if (registryKey.Value.KeyName.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        yield return new SearchHit(registryKey.Value, null, searchTerm);
+                        yield return new SearchHit(registryKey.Value, null, searchTerm, searchTerm);
                     }
                 }
             }
@@ -1384,21 +1551,21 @@ namespace Registry
                 {
                     if (start <= registryKey.Value.LastWriteTime && registryKey.Value.LastWriteTime <= end)
                     {
-                        yield return new SearchHit(registryKey.Value, null, null);
+                        yield return new SearchHit(registryKey.Value, null, null, null);
                     }
                 }
                 else if (end != null)
                 {
                     if (registryKey.Value.LastWriteTime < end)
                     {
-                        yield return new SearchHit(registryKey.Value, null, null);
+                        yield return new SearchHit(registryKey.Value, null, null, null);
                     }
                 }
                 else if (start != null)
                 {
                     if (registryKey.Value.LastWriteTime > start)
                     {
-                        yield return new SearchHit(registryKey.Value, null, null);
+                        yield return new SearchHit(registryKey.Value, null, null, null);
                     }
                 }
             }
@@ -1407,22 +1574,20 @@ namespace Registry
         public IEnumerable<SearchHit> FindInValueName(string searchTerm, bool useRegEx = false)
         {
             foreach (var registryKey in _keyPathKeyMap)
+            foreach (var keyValue in registryKey.Value.Values)
             {
-                foreach (var keyValue in registryKey.Value.Values)
+                if (useRegEx)
                 {
-                    if (useRegEx)
+                    if (Regex.IsMatch(keyValue.ValueName, searchTerm, RegexOptions.IgnoreCase))
                     {
-                        if (Regex.IsMatch(keyValue.ValueName, searchTerm, RegexOptions.IgnoreCase))
-                        {
-                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
-                        }
+                        yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
                     }
-                    else
+                }
+                else
+                {
+                    if (keyValue.ValueName.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        if (keyValue.ValueName.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
-                        }
+                        yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
                     }
                 }
             }
@@ -1434,90 +1599,88 @@ namespace Registry
             //   var _logger = LogManager.GetLogger("FFFFFFF");
 
             foreach (var registryKey in _keyPathKeyMap)
-            {
                 //   _logger.Debug($"Iterating key {registryKey.Value.KeyName} in path {registryKey.Value.KeyPath}. searchTerm: {searchTerm}, regex: {useRegEx}, literal: {literal}");
 
-                foreach (var keyValue in registryKey.Value.Values)
+            foreach (var keyValue in registryKey.Value.Values)
+                // _logger.Debug($"Searching value {keyValue.ValueName}");
+
+            {
+                if (useRegEx)
                 {
-                    // _logger.Debug($"Searching value {keyValue.ValueName}");
-
-                    if (useRegEx)
+                    if (Regex.IsMatch(keyValue.ValueData, searchTerm, RegexOptions.IgnoreCase))
                     {
-                        if (Regex.IsMatch(keyValue.ValueData, searchTerm, RegexOptions.IgnoreCase))
-                        {
-                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
-                        }
+                        yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
                     }
-                    else
+                }
+                else
+                {
+                    //plaintext matching
+                    if (keyValue.ValueData.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        //plaintext matching
-                        if (keyValue.ValueData.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
+                        yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
+                    }
+
+                    if (literal)
+                    {
+                        continue;
+                    }
+
+                    //    _logger.Debug($"After literal match");
+
+                    var asAscii = keyValue.ValueData;
+                    var asUnicode = keyValue.ValueData;
+
+                    if (keyValue.VkRecord.DataType == VkCellRecord.DataTypeEnum.RegBinary)
+                    {
+                        //this takes the raw bytes and converts it to a string, which we can then search
+                        //the regex will find us the hit with exact capitalization, which we can then convert to a byte string
+                        //and match against the raw data
+                        asAscii = Encoding.GetEncoding(1252).GetString(keyValue.ValueDataRaw);
+                        asUnicode = Encoding.Unicode.GetString(keyValue.ValueDataRaw);
+
+                        var hitString = string.Empty;
+                        try
                         {
-                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
+                            hitString = Regex.Match(asAscii, searchTerm, RegexOptions.IgnoreCase).Value;
+                        }
+                        catch (ArgumentException)
+                        {
+                            // Syntax error in the regular expression
                         }
 
-                        if (literal)
+                        //        _logger.Debug($"hitstring 1: {hitString}");
+
+                        if (hitString.Length > 0)
+                        {
+                            var asciihex = Encoding.GetEncoding(1252).GetBytes(hitString);
+
+                            var asciiHit = BitConverter.ToString(asciihex);
+                            yield return new SearchHit(registryKey.Value, keyValue, asciiHit, hitString);
+                        }
+
+                        hitString = string.Empty;
+                        try
+                        {
+                            hitString = Regex.Match(asUnicode, searchTerm, RegexOptions.IgnoreCase).Value;
+                        }
+                        catch (ArgumentException)
+                        {
+                            // Syntax error in the regular expression
+                        }
+
+                        //    _logger.Debug($"hitstring 2: {hitString}");
+
+                        if (hitString.Length <= 0)
                         {
                             continue;
                         }
 
-                        //    _logger.Debug($"After literal match");
+                        //     _logger.Debug($"before unicodehex");
 
-                        var asAscii = keyValue.ValueData;
-                        var asUnicode = keyValue.ValueData;
+                        var unicodehex = Encoding.Unicode.GetBytes(hitString);
 
-                        if (keyValue.VkRecord.DataType == VkCellRecord.DataTypeEnum.RegBinary)
-                        {
-                            //this takes the raw bytes and converts it to a string, which we can then search
-                            //the regex will find us the hit with exact capitalization, which we can then convert to a byte string
-                            //and match against the raw data
-                            asAscii = Encoding.GetEncoding(1252).GetString(keyValue.ValueDataRaw);
-                            asUnicode = Encoding.Unicode.GetString(keyValue.ValueDataRaw);
-
-                            var hitString = string.Empty;
-                            try
-                            {
-                                hitString = Regex.Match(asAscii, searchTerm, RegexOptions.IgnoreCase).Value;
-                            }
-                            catch (ArgumentException)
-                            {
-                                // Syntax error in the regular expression
-                            }
-
-                            //        _logger.Debug($"hitstring 1: {hitString}");
-
-                            if (hitString.Length > 0)
-                            {
-                                var asciihex = Encoding.GetEncoding(1252).GetBytes(hitString);
-
-                                var asciiHit = BitConverter.ToString(asciihex);
-                                yield return new SearchHit(registryKey.Value, keyValue, asciiHit);
-                            }
-
-                            hitString = string.Empty;
-                            try
-                            {
-                                hitString = Regex.Match(asUnicode, searchTerm, RegexOptions.IgnoreCase).Value;
-                            }
-                            catch (ArgumentException)
-                            {
-                                // Syntax error in the regular expression
-                            }
-
-                            //    _logger.Debug($"hitstring 2: {hitString}");
-
-                            if (hitString.Length <= 0)
-                            {
-                                continue;
-                            }
-
-                            //     _logger.Debug($"before unicodehex");
-
-                            var unicodehex = Encoding.Unicode.GetBytes(hitString);
-
-                            var unicodeHit = BitConverter.ToString(unicodehex);
-                            yield return new SearchHit(registryKey.Value, keyValue, unicodeHit);
-                        }
+                        var unicodeHit = BitConverter.ToString(unicodehex);
+                        yield return new SearchHit(registryKey.Value, keyValue, unicodeHit, hitString);
                     }
                 }
             }
@@ -1527,71 +1690,69 @@ namespace Registry
             bool literal = false)
         {
             foreach (var registryKey in _keyPathKeyMap)
+            foreach (var keyValue in registryKey.Value.Values)
             {
-                foreach (var keyValue in registryKey.Value.Values)
+                if (useRegEx)
                 {
-                    if (useRegEx)
+                    if (Regex.IsMatch(keyValue.ValueSlack, searchTerm, RegexOptions.IgnoreCase))
                     {
-                        if (Regex.IsMatch(keyValue.ValueSlack, searchTerm, RegexOptions.IgnoreCase))
+                        yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
+                    }
+                }
+                else
+                {
+                    if (literal)
+                    {
+                        if (keyValue.ValueSlack.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
+                            yield return new SearchHit(registryKey.Value, keyValue, searchTerm, searchTerm);
                         }
                     }
                     else
                     {
-                        if (literal)
+                        //this takes the raw bytes and converts it to a string, which we can then search
+                        //the regex will find us the hit with exact capitalization, which we can then convert to a byte string
+                        //and match against the raw data
+                        var asAscii = Encoding.GetEncoding(1252).GetString(keyValue.ValueSlackRaw);
+                        var asUnicode = Encoding.Unicode.GetString(keyValue.ValueSlackRaw);
+
+                        var hitString = string.Empty;
+                        try
                         {
-                            if (keyValue.ValueSlack.IndexOf(searchTerm, StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                yield return new SearchHit(registryKey.Value, keyValue, searchTerm);
-                            }
+                            hitString = Regex.Match(asAscii, searchTerm, RegexOptions.IgnoreCase).Value;
                         }
-                        else
+                        catch (ArgumentException)
                         {
-                            //this takes the raw bytes and converts it to a string, which we can then search
-                            //the regex will find us the hit with exact capitalization, which we can then convert to a byte string
-                            //and match against the raw data
-                            var asAscii = Encoding.GetEncoding(1252).GetString(keyValue.ValueSlackRaw);
-                            var asUnicode = Encoding.Unicode.GetString(keyValue.ValueSlackRaw);
-
-                            var hitString = string.Empty;
-                            try
-                            {
-                                hitString = Regex.Match(asAscii, searchTerm, RegexOptions.IgnoreCase).Value;
-                            }
-                            catch (ArgumentException)
-                            {
-                                // Syntax error in the regular expression
-                            }
-
-                            if (hitString.Length > 0)
-                            {
-                                var asciihex = Encoding.GetEncoding(1252).GetBytes(hitString);
-
-                                var asciiHit = BitConverter.ToString(asciihex);
-                                yield return new SearchHit(registryKey.Value, keyValue, asciiHit);
-                            }
-
-                            hitString = string.Empty;
-                            try
-                            {
-                                hitString = Regex.Match(asUnicode, searchTerm, RegexOptions.IgnoreCase).Value;
-                            }
-                            catch (ArgumentException)
-                            {
-                                // Syntax error in the regular expression
-                            }
-
-                            if (hitString.Length <= 0)
-                            {
-                                continue;
-                            }
-
-                            var unicodehex = Encoding.Unicode.GetBytes(hitString);
-
-                            var unicodeHit = BitConverter.ToString(unicodehex);
-                            yield return new SearchHit(registryKey.Value, keyValue, unicodeHit);
+                            // Syntax error in the regular expression
                         }
+
+                        if (hitString.Length > 0)
+                        {
+                            var asciihex = Encoding.GetEncoding(1252).GetBytes(hitString);
+
+                            var asciiHit = BitConverter.ToString(asciihex);
+                            yield return new SearchHit(registryKey.Value, keyValue, asciiHit, hitString);
+                        }
+
+                        hitString = string.Empty;
+                        try
+                        {
+                            hitString = Regex.Match(asUnicode, searchTerm, RegexOptions.IgnoreCase).Value;
+                        }
+                        catch (ArgumentException)
+                        {
+                            // Syntax error in the regular expression
+                        }
+
+                        if (hitString.Length <= 0)
+                        {
+                            continue;
+                        }
+
+                        var unicodehex = Encoding.Unicode.GetBytes(hitString);
+
+                        var unicodeHit = BitConverter.ToString(unicodehex);
+                        yield return new SearchHit(registryKey.Value, keyValue, unicodeHit, hitString);
                     }
                 }
             }

@@ -16,7 +16,7 @@ namespace Registry
         {
         }
 
-        public RegistryHiveOnDemand(byte[] rawBytes) : base(rawBytes)
+        public RegistryHiveOnDemand(byte[] rawBytes, string fileName) : base(rawBytes,fileName)
         {
         }
 
@@ -24,7 +24,7 @@ namespace Registry
         {
             var keys = new List<RegistryKey>();
 
-            Logger.Trace("Looking for list record at relative offset 0x{0:X}", subkeyListsStableCellIndex);
+        //    Logger.Trace("Looking for list record at relative offset 0x{0:X}", subkeyListsStableCellIndex);
 
             var rawList = GetRawRecord(subkeyListsStableCellIndex);
 
@@ -39,7 +39,7 @@ namespace Registry
                     var lxRecord = l as LxListRecord;
                     foreach (var offset in lxRecord.Offsets)
                     {
-                        Logger.Trace("In lf or lh, looking for nk record at relative offset 0x{0:X}", offset);
+             //           Logger.Trace("In lf or lh, looking for nk record at relative offset 0x{0:X}", offset);
                         var rawCell = GetRawRecord(offset.Key);
                         var nk = new NkCellRecord(rawCell.Length, offset.Key, this);
 
@@ -57,7 +57,7 @@ namespace Registry
                     var riRecord = l as RiListRecord;
                     foreach (var offset in riRecord.Offsets)
                     {
-                        Logger.Trace("In ri, looking for list record at relative offset 0x{0:X}", offset);
+            //            Logger.Trace("In ri, looking for list record at relative offset 0x{0:X}", offset);
                         rawList = GetRawRecord(offset);
 
                         var tempList = GetListFromRawBytes(rawList, offset);
@@ -85,7 +85,7 @@ namespace Registry
 
                             foreach (var offset3 in lxRecord1.Offsets)
                             {
-                                Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}", offset3);
+                          //      Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}", offset3);
                                 var rawCell = GetRawRecord(offset3.Key);
                                 var nk = new NkCellRecord(rawCell.Length, offset3.Key, this);
 
@@ -128,8 +128,8 @@ namespace Registry
 
             if (valueListCellIndex > 0)
             {
-                Logger.Trace("Getting value list offset at relative offset 0x{0:X}. Value count is {1:N0}",
-                    valueListCellIndex, valueListCount);
+          //      Logger.Trace("Getting value list offset at relative offset 0x{0:X}. Value count is {1:N0}",
+          //      valueListCellIndex, valueListCount);
 
                 var offsetList = GetDataNodeFromOffset(valueListCellIndex);
 
@@ -137,7 +137,7 @@ namespace Registry
                 {
                     //use i * 4 so we get 4, 8, 12, 16, etc
                     var os = BitConverter.ToUInt32(offsetList.Data, i * 4);
-                    Logger.Trace("Got value offset 0x{0:X}", os);
+               //     Logger.Trace("Got value offset 0x{0:X}", os);
                     offsets.Add(os);
                 }
             }
@@ -145,7 +145,7 @@ namespace Registry
             if (offsets.Count != valueListCount)
             {
                 //ncrunch: no coverage
-                Logger.Warn(
+                Logger.Debug(
                     "Value count mismatch! ValueListCount is {0:N0} but NKRecord.ValueOffsets.Count is {1:N0}",
                     //ncrunch: no coverage
                     valueListCount, offsets.Count);
@@ -153,12 +153,12 @@ namespace Registry
 
             foreach (var valueOffset in offsets)
             {
-                Logger.Trace("Looking for vk record at relative offset 0x{0:X}", valueOffset);
+         //       Logger.Trace("Looking for vk record at relative offset 0x{0:X}", valueOffset);
 
                 var rawVk = GetRawRecord(valueOffset);
                 var vk = new VkCellRecord(rawVk.Length, valueOffset, Header.MinorVersion, this);
 
-                Logger.Trace("Found vk record at relative offset 0x{0:X}. Value name: {1}", valueOffset, vk.ValueName);
+            //    Logger.Trace("Found vk record at relative offset 0x{0:X}. Value name: {1}", valueOffset, vk.ValueName);
                 var value = new KeyValue(vk);
                 values.Add(value);
             }
@@ -217,7 +217,7 @@ namespace Registry
             var newPath = keyPath.ToLowerInvariant();
 
             // when getting child keys, the name may start with the root key name. if so, strip it
-            if (newPath.StartsWith(rootNk.Name.ToLowerInvariant()))
+            if (newPath.StartsWith(rootNk.Name, StringComparison.OrdinalIgnoreCase))
             {
                 var segs = keyPath.Split('\\');
                 newPath = string.Join("\\", segs.Skip(1));
@@ -235,7 +235,7 @@ namespace Registry
             {
                 finalKey =
                     finalKey.SubKeys.SingleOrDefault(
-                        r => r.KeyName.ToLowerInvariant() == keyNames[i].ToLowerInvariant());
+                        r => string.Equals(r.KeyName, keyNames[i], StringComparison.OrdinalIgnoreCase));
 
                 if (finalKey == null)
                 {
@@ -253,13 +253,13 @@ namespace Registry
 
             if (finalKey.NkRecord.ClassCellIndex > 0)
             {
-                Logger.Trace("Getting Class cell information at relative offset 0x{0:X}",
-                    finalKey.NkRecord.ClassCellIndex);
+           //     Logger.Trace("Getting Class cell information at relative offset 0x{0:X}",
+           //   finalKey.NkRecord.ClassCellIndex);
                 var d = GetDataNodeFromOffset(finalKey.NkRecord.ClassCellIndex);
                 d.IsReferenced = true;
                 var clsName = Encoding.Unicode.GetString(d.Data, 0, finalKey.NkRecord.ClassLength);
                 finalKey.ClassName = clsName;
-                Logger.Debug("Class name found {0}", clsName);
+           //     Logger.Trace("Class name found {0}", clsName);
             }
 
             return finalKey;

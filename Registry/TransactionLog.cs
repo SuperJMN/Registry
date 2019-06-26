@@ -15,7 +15,7 @@ namespace Registry
 
         private bool _parsed;
 
-        public TransactionLog(byte[] rawBytes)
+        public TransactionLog(byte[] rawBytes, string logFile)
         {
             FileBytes = rawBytes;
             LogPath = "None";
@@ -28,6 +28,10 @@ namespace Registry
 
                 throw new ArgumentException("Data in byte array is not a Registry transaction log (bad signature)");
             }
+
+            LogPath = logFile;
+
+            TransactionLogEntries = new List<TransactionLogEntry>();
 
             Initialize();
         }
@@ -78,10 +82,13 @@ namespace Registry
         public byte[] FileBytes { get; }
 
         public string LogPath { get; }
+        public string Version { get; private set; }
 
         public RegistryHeader Header { get; set; }
         public HiveTypeEnum HiveType { get; private set; }
         public List<TransactionLogEntry> TransactionLogEntries { get; }
+
+        public int NewSequenceNumber { get; private set; }
 
         private byte[] ReadBytesFromHive(long offset, int length)
         {
@@ -108,11 +115,11 @@ namespace Registry
         {
             var header = ReadBytesFromHive(0, 4096);
 
-            Logger.Debug("Getting header");
+         //   Logger.Trace("Getting header");
 
             Header = new RegistryHeader(header);
 
-            Logger.Debug("Got header. Embedded file name {0}", Header.FileName);
+        //    Logger.Trace("Got header. Embedded file name {0}", Header.FileName);
 
             var fNameBase = Path.GetFileName(Header.FileName).ToLowerInvariant();
 
@@ -145,16 +152,22 @@ namespace Registry
                 case "bcd":
                     HiveType = HiveTypeEnum.Bcd;
                     break;
+                case "amcache.hve":
+                    HiveType = HiveTypeEnum.Amcache;
+                    break;
+                case "syscache.hve":
+                    HiveType = HiveTypeEnum.Syscache;
+                    break;
                 default:
                     HiveType = HiveTypeEnum.Other;
                     break;
             }
 
-            Logger.Debug($"Hive is a {HiveType} hive");
+       //     Logger.Trace($"Hive is a {HiveType} hive");
 
-            var version = $"{Header.MajorVersion}.{Header.MinorVersion}";
+           Version = $"{Header.MajorVersion}.{Header.MinorVersion}";
 
-            Logger.Debug($"Hive version is {version}");
+        //    Logger.Trace($"Hive version is {version}");
         }
 
         public bool ParseLog()
@@ -164,7 +177,7 @@ namespace Registry
                 throw new Exception("ParseLog already called");
             }
 
-            var index = 0x200; //data starts at offset 500 decimal
+            var index = 0x200; //data starts at offset 512 decimal
 
             while (index < FileBytes.Length)
             {
@@ -197,17 +210,25 @@ namespace Registry
         /// </summary>
         /// <param name="hiveBytes"></param>
         /// <remarks>This method does nothing to determine IF the data should be overwritten</remarks>
-        /// <returns>Byte array containing the updaated hive</returns>
+        /// <returns>Byte array containing the updated hive</returns>
         public byte[] UpdateHiveBytes(byte[] hiveBytes)
         {
             const int baseOffset = 0x1000; //hbins start at 4096 bytes
 
             foreach (var transactionLogEntry in TransactionLogEntries)
             {
-                Logger.Debug($"Processing log entry: {transactionLogEntry}");
+                if (transactionLogEntry.HasValidHashes() == false)
+                {
+                    Logger.Debug($"Skipping transaction log entry with sequence # 0x{transactionLogEntry.SequenceNumber:X}. Hash verification failed");
+                    continue;
+                }
+           //     Logger.Trace($"Processing log entry: {transactionLogEntry}");
+
+                NewSequenceNumber = transactionLogEntry.SequenceNumber;
+
                 foreach (var dirtyPage in transactionLogEntry.DirtyPages)
                 {
-                    Logger.Debug($"Processing dirty page: {dirtyPage}");
+               //     Logger.Trace($"Processing dirty page: {dirtyPage}");
 
                     Buffer.BlockCopy(dirtyPage.PageBytes, 0, hiveBytes, dirtyPage.Offset + baseOffset, dirtyPage.Size);
                 }

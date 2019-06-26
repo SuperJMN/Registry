@@ -130,6 +130,12 @@ namespace Registry.Abstractions
                 case HiveTypeEnum.Components:
                     keyBase = "HKEY_CURRENT_USER\\COMPONENTS";
                     break;
+                case HiveTypeEnum.Amcache:
+                    keyBase = "";
+                    break;
+                case HiveTypeEnum.Syscache:
+                    keyBase = "";
+                    break;
 
                 default:
                     keyBase = "HKEY_CURRENT_USER\\UNKNOWN_BASEPATH";
@@ -161,7 +167,7 @@ namespace Registry.Abstractions
                     keyNameOut = $"\"{keyNameOut.Replace("\"", "\\\"")}\"";
                 }
 
-                var keyValueOut = "";
+                var keyValueOut = string.Empty;
 
                 switch (keyValue.VkRecord.DataType)
                 {

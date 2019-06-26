@@ -16,7 +16,7 @@ namespace Registry
             throw new NotSupportedException("Call the other constructor and pass in the path to the Registry hive!");
         }
 
-        public RegistryBase(byte[] rawBytes)
+        public RegistryBase(byte[] rawBytes, string hivePath)
         {
             FileBytes = rawBytes;
             HivePath = "None";
@@ -30,6 +30,8 @@ namespace Registry
                 throw new ArgumentException("Data in byte array is not a Registry hive (bad signature)");
             }
 
+            HivePath = hivePath;
+
             Initialize();
         }
 
@@ -42,7 +44,8 @@ namespace Registry
 
             if (!File.Exists(hivePath))
             {
-                throw new FileNotFoundException();
+                var fullPath =  Path.GetFullPath(hivePath);
+                throw new FileNotFoundException($"The specified file {fullPath} was not found.", fullPath);
             }
 
             var fileStream = new FileStream(hivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -66,7 +69,7 @@ namespace Registry
 
             HivePath = hivePath;
 
-            Logger.Debug("Set HivePath to {0}", hivePath);
+        //    Logger.Trace("Set HivePath to {0}", hivePath);
 
             Initialize();
         }
@@ -78,13 +81,13 @@ namespace Registry
         public HiveTypeEnum HiveType { get; private set; }
 
         public string HivePath { get; }
+        public string Version { get; private set; }
 
         public RegistryHeader Header { get; set; }
 
         public byte[] ReadBytesFromHive(long offset, int length)
         {
             var readLength = Math.Abs(length);
-
 
             var remaining = FileBytes.Length - offset;
 
@@ -107,11 +110,11 @@ namespace Registry
         {
             var header = ReadBytesFromHive(0, 4096);
 
-            Logger.Debug("Getting header");
+        //    Logger.Trace("Getting header");
 
             Header = new RegistryHeader(header);
 
-            Logger.Debug("Got header. Embedded file name {0}", Header.FileName);
+        //    Logger.Trace("Got header. Embedded file name {0}", Header.FileName);
 
             var fNameBase = Path.GetFileName(Header.FileName).ToLowerInvariant();
 
@@ -144,16 +147,22 @@ namespace Registry
                 case "bcd":
                     HiveType = HiveTypeEnum.Bcd;
                     break;
+                case "amcache.hve":
+                    HiveType = HiveTypeEnum.Amcache;
+                    break;
+                case "syscache.hve":
+                    HiveType = HiveTypeEnum.Syscache;
+                    break;
                 default:
                     HiveType = HiveTypeEnum.Other;
                     break;
             }
 
-            Logger.Debug("Hive is a {0} hive", HiveType);
+        //    Logger.Trace("Hive is a {0} hive", HiveType);
 
-            var version = $"{Header.MajorVersion}.{Header.MinorVersion}";
+           Version = $"{Header.MajorVersion}.{Header.MinorVersion}";
 
-            Logger.Debug("Hive version is {0}", version);
+         //   Logger.Trace("Hive version is {0}", version);
         }
 
         public bool HasValidSignature()
